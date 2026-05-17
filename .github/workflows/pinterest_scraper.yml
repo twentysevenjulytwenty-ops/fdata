@@ -62,6 +62,5 @@ jobs:
           then echo "No changes to commit"
           else
             git commit -m "Ultra-Fast Scrape Update - Run #${{ github.run_number }}"
-            git pull --rebase origin ${{ github.ref_name }}
             git push origin ${{ github.ref_name }}
           fi
