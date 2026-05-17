@@ -7,6 +7,7 @@ on:
         description: 'Pinterest Profile URLs (Comma separated for multiple)'
         required: true
         default: 'https://www.pinterest.com/amiller1119/_created'
+
   schedule:
     - cron: '0 12 * * *'
 
@@ -16,32 +17,32 @@ jobs:
     timeout-minutes: 360
     permissions:
       contents: write
-    
+
     steps:
       - name: Checkout Repository
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
-      
+
       - name: Setup Python
         uses: actions/setup-python@v5
         with:
           python-version: '3.11'
-      
+
       - name: Install Dependencies
         run: |
           python -m pip install --upgrade pip
           pip install playwright
           python -m playwright install chromium
           python -m playwright install-deps
-      
+
       - name: Run Pinterest Scraper
         env:
           PROFILE_URLS: ${{ github.event.inputs.profile_urls || 'https://www.pinterest.com/amiller1119/_created' }}
         run: |
           ulimit -n 4096
           python pinterest_scraper.py
-      
+
       - name: Upload Results
         uses: actions/upload-artifact@v4
         if: always()
@@ -49,19 +50,16 @@ jobs:
           name: pinterest-data-${{ github.run_number }}
           path: output/
           retention-days: 30
-      
+
       - name: Commit and Push Results
         if: success()
         run: |
           git config --local user.email "github-actions[bot]@users.noreply.github.com"
           git config --local user.name "github-actions[bot]"
-          
-          mkdir -p output
-          # Add all CSV files in the output directory
+          mkdir -p output # Add all CSV files in the output directory
           git add output/*.csv
-          
-          if git diff --staged --quiet; then
-            echo "No changes to commit"
+          if git diff --staged --quiet;
+          then echo "No changes to commit"
           else
             git commit -m "Ultra-Fast Scrape Update - Run #${{ github.run_number }}"
             git pull --rebase origin ${{ github.ref_name }}
