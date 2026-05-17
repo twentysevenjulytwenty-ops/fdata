@@ -5,14 +5,15 @@ Ye script maximum reliability aur speed ke liye design ki gayi hai.
 Ye boards aur individual pins dono ko handle karti hai.
 
 Key Features:
-- Separate Files: Har profile ka data alag CSV file mein save hota hai.
-- Duplicate Removal: Same Title aur Saves wale pins ko remove kar diya jata hai.
+- Separate Files: Har profile ka data alag CSV file mein save hota.
+- Duplicate Removal: Overall unique titles rakhe jate hain (first occurrence).
 - Multi-URL Support: GitHub Actions se multiple URLs handle kar sakti hai.
 """
 
 import asyncio
 import csv
 import re
+import html
 from playwright.async_api import async_playwright
 from datetime import datetime
 import os
@@ -40,6 +41,7 @@ NO_NEW_PINS_WAIT = 15    # Wait longer for large profiles
 # Global state for current profile
 results = []
 seen_urls = set()
+seen_titles_for_profile = set() # To track unique titles per profile
 queue = asyncio.Queue()
 processed_count = 0
 extraction_done = asyncio.Event()
@@ -49,7 +51,6 @@ def get_filename_from_url(url):
     """Extracts a clean filename from the Pinterest URL."""
     clean_url = url.split("?")[0].rstrip("/")
     parts = clean_url.split("/")
-    # Try to get username or board name
     if len(parts) >= 4:
         name = f"{parts[3]}_{parts[4]}" if len(parts) > 4 else parts[3]
         name = re.sub(r"[^a-zA-Z0-9_]", "_", name)
@@ -57,7 +58,7 @@ def get_filename_from_url(url):
     return "pinterest_data.csv"
 
 async def get_pin_details_worker(browser, semaphore):
-    global processed_count, results, seen_urls
+    global processed_count, results, seen_urls, seen_titles_for_profile
     while True:
         try:
             url = await asyncio.wait_for(queue.get(), timeout=5)
@@ -86,35 +87,48 @@ async def get_pin_details_worker(browser, semaphore):
                     title = "N/A"
                     
                     # 1. Prioritize og:title
-                    og_title_match = re.search(r'<meta property="og:title" content="(.*?)"', content)
+                    og_title_match = re.search(r'<meta property="og:title" content="(.*?)">', content)
                     if og_title_match:
                         extracted_title = og_title_match.group(1).replace(' - Pinterest', '').strip()
-                        if extracted_title: # Ensure it's not empty
+                        if extracted_title and not extracted_title.lower().startswith("pin on "):
                             title = extracted_title
                     
                     # 2. Fallback to <meta name="title">
-                    if title == "N/A":
-                        meta_title_match = re.search(r'<meta name="title" content="(.*?)"', content)
+                    if title == "N/A" or title.lower().startswith("pin on "):
+                        meta_title_match = re.search(r'<meta name="title" content="(.*?)">', content)
                         if meta_title_match:
                             extracted_title = meta_title_match.group(1).strip()
-                            if extracted_title: # Ensure it's not empty
+                            if extracted_title and not extracted_title.lower().startswith("pin on "):
                                 title = extracted_title
 
                     # 3. Fallback to <h1>
-                    if title == "N/A":
+                    if title == "N/A" or title.lower().startswith("pin on "):
                         h1_title_match = re.search(r'<h1[^>]*>(.*?)</h1>', content, re.IGNORECASE | re.DOTALL)
                         if h1_title_match:
                             extracted_title = re.sub('<[^<]+?>', '', h1_title_match.group(1)).strip()
-                            if extracted_title: # Ensure it's not empty
+                            if extracted_title and not extracted_title.lower().startswith("pin on "):
                                 title = extracted_title
                     
                     # 4. Fallback to <title>
-                    if title == "N/A":
+                    if title == "N/A" or title.lower().startswith("pin on "):
                         page_title_match = re.search(r'<title>(.*?)</title>', content, re.IGNORECASE | re.DOTALL)
                         if page_title_match:
                             extracted_title = page_title_match.group(1).replace(' - Pinterest', '').strip()
-                            if extracted_title: # Ensure it's not empty
+                            if extracted_title and not extracted_title.lower().startswith("pin on "):
                                 title = extracted_title
+
+                    # If still a generic title, try to extract something more meaningful from the URL or content
+                    if title == "N/A" or title.lower().startswith("pin on "):
+                        # Attempt to get a more descriptive title from the URL path if available
+                        url_parts = url.split('/')
+                        if len(url_parts) > 4 and url_parts[3] == 'pin':
+                            potential_title = url_parts[4].replace('-', ' ').replace('_', ' ').strip()
+                            if potential_title:
+                                title = potential_title
+                        
+                    # Decode HTML entities (e.g., &amp; -> &)
+                    if title:
+                        title = html.unescape(title)
 
                     patterns = [
                         r'"saves"[:\s]+(\d+)',
@@ -132,17 +146,21 @@ async def get_pin_details_worker(browser, semaphore):
                             break
                     
                     async with results_lock:
+                        # Check for URL uniqueness first
                         if url not in seen_urls:
                             seen_urls.add(url)
-                            results.append({
-                                'url': url,
-                                'title': title[:200],
-                                'saves': saves_count,
-                                'timestamp': datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-                            })
-                            processed_count += 1
-                            if processed_count % 5 == 0:
-                                print(f"   ⚡ Processed {processed_count} unique pins... (Queue: {queue.qsize()})", end='\r')
+                            # Then check for title uniqueness for the current profile
+                            if title not in seen_titles_for_profile:
+                                seen_titles_for_profile.add(title)
+                                results.append({
+                                    'url': url,
+                                    'title': title[:200] if title else "N/A",
+                                    'saves': saves_count,
+                                    'timestamp': datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+                                })
+                                processed_count += 1
+                                if processed_count % 5 == 0:
+                                    print(f"   ⚡ Processed {processed_count} unique pins... (Queue: {queue.qsize()})", end='\r')
                     
                     success = True
                 except Exception:
@@ -158,11 +176,12 @@ async def get_pin_details_worker(browser, semaphore):
 
 async def scrape_single_profile(browser, profile_url, semaphore):
     """Scrapes a single profile and saves its results."""
-    global results, seen_urls, processed_count, extraction_done
+    global results, seen_urls, processed_count, extraction_done, seen_titles_for_profile
     
     # Reset state for new profile
     results = []
     seen_urls = set()
+    seen_titles_for_profile = set() # Reset for each profile
     processed_count = 0
     extraction_done = asyncio.Event()
     while not queue.empty(): queue.get_nowait()
@@ -218,13 +237,13 @@ async def scrape_single_profile(browser, profile_url, semaphore):
     if results:
         filename = get_filename_from_url(profile_url)
         filepath = os.path.join(OUTPUT_DIR, filename)
-        sorted_results = sorted(results, key=lambda x: x['saves'] if isinstance(x['saves'], int) else -1, reverse=True)
+        # No sorting by saves, just output as collected (which is effectively by URL first seen)
         
         with open(filepath, 'w', newline='', encoding='utf-8') as f:
             writer = csv.DictWriter(f, fieldnames=['url', 'title', 'saves', 'timestamp'])
             writer.writeheader()
-            writer.writerows(sorted_results)
-        print(f"\n✅ Saved {len(results)} unique pins to {filename}")
+            writer.writerows(results)
+        print(f"\n✅ Saved {len(results)} unique title pins to {filename}")
 
 async def main():
     start_time = datetime.now()
