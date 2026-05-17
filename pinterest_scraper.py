@@ -40,7 +40,6 @@ NO_NEW_PINS_WAIT = 15    # Wait longer for large profiles
 # Global state for current profile
 results = []
 seen_urls = set()
-# seen_content = set() # This is no longer needed as we will use seen_urls for uniqueness
 queue = asyncio.Queue()
 processed_count = 0
 extraction_done = asyncio.Event()
@@ -48,17 +47,17 @@ results_lock = asyncio.Lock()
 
 def get_filename_from_url(url):
     """Extracts a clean filename from the Pinterest URL."""
-    clean_url = url.split('?')[0].rstrip('/')
-    parts = clean_url.split('/')
+    clean_url = url.split("?")[0].rstrip("/")
+    parts = clean_url.split("/")
     # Try to get username or board name
     if len(parts) >= 4:
         name = f"{parts[3]}_{parts[4]}" if len(parts) > 4 else parts[3]
-        name = re.sub(r'[^a-zA-Z0-9_]', '_', name)
+        name = re.sub(r"[^a-zA-Z0-9_]", "_", name)
         return f"pinterest_{name}.csv"
     return "pinterest_data.csv"
 
 async def get_pin_details_worker(browser, semaphore):
-    global processed_count, results, seen_urls # Added results and seen_urls to global
+    global processed_count, results, seen_urls
     while True:
         try:
             url = await asyncio.wait_for(queue.get(), timeout=5)
@@ -85,21 +84,37 @@ async def get_pin_details_worker(browser, semaphore):
                     content = await page.content()
                     
                     title = "N/A"
-                    # Prioritize og:title as it's usually more accurate for pin titles
+                    
+                    # 1. Prioritize og:title
                     og_title_match = re.search(r'<meta property="og:title" content="(.*?)"', content)
                     if og_title_match:
-                        title = og_title_match.group(1).replace(' - Pinterest', '').strip()
+                        extracted_title = og_title_match.group(1).replace(' - Pinterest', '').strip()
+                        if extracted_title: # Ensure it's not empty
+                            title = extracted_title
                     
-                    if title == "N/A" or not title:
+                    # 2. Fallback to <meta name="title">
+                    if title == "N/A":
+                        meta_title_match = re.search(r'<meta name="title" content="(.*?)"', content)
+                        if meta_title_match:
+                            extracted_title = meta_title_match.group(1).strip()
+                            if extracted_title: # Ensure it's not empty
+                                title = extracted_title
+
+                    # 3. Fallback to <h1>
+                    if title == "N/A":
                         h1_title_match = re.search(r'<h1[^>]*>(.*?)</h1>', content, re.IGNORECASE | re.DOTALL)
                         if h1_title_match:
-                            title = re.sub('<[^<]+?>', '', h1_title_match.group(1)).strip()
+                            extracted_title = re.sub('<[^<]+?>', '', h1_title_match.group(1)).strip()
+                            if extracted_title: # Ensure it's not empty
+                                title = extracted_title
                     
-                    # Fallback to page title if og:title and h1 are not found
-                    if title == "N/A" or not title:
+                    # 4. Fallback to <title>
+                    if title == "N/A":
                         page_title_match = re.search(r'<title>(.*?)</title>', content, re.IGNORECASE | re.DOTALL)
                         if page_title_match:
-                            title = page_title_match.group(1).replace(' - Pinterest', '').strip()
+                            extracted_title = page_title_match.group(1).replace(' - Pinterest', '').strip()
+                            if extracted_title: # Ensure it's not empty
+                                title = extracted_title
 
                     patterns = [
                         r'"saves"[:\s]+(\d+)',
@@ -116,10 +131,9 @@ async def get_pin_details_worker(browser, semaphore):
                             saves_count = max([int(m) for m in matches])
                             break
                     
-                    # Use URL for uniqueness check instead of (title, saves)
                     async with results_lock:
-                        if url not in seen_urls: # Check against seen_urls for overall uniqueness
-                            seen_urls.add(url) # Add to seen_urls here to mark as processed for results
+                        if url not in seen_urls:
+                            seen_urls.add(url)
                             results.append({
                                 'url': url,
                                 'title': title[:200],
@@ -172,23 +186,21 @@ async def scrape_single_profile(browser, profile_url, semaphore):
                 href = await link.get_attribute('href')
                 if href:
                     url = f"https://www.pinterest.com{href.split('?')[0]}" if href.startswith('/') else href.split('?')[0]
-                    # Only add to queue if not already seen (this prevents redundant processing)
                     if url not in seen_urls:
-                        # We don't add to seen_urls here, only when successfully processed by worker
                         await queue.put(url)
             
-            if queue.qsize() >= TARGET_COUNT: break # Changed from len(seen_urls) to queue.qsize()
-            if queue.qsize() == previous_total: # Changed from len(seen_urls) to queue.qsize()
+            if queue.qsize() >= TARGET_COUNT: break
+            if queue.qsize() == previous_total:
                 no_new_items_count += 1
                 if no_new_items_count >= NO_NEW_PINS_WAIT:
                     await page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
                     await asyncio.sleep(5)
-                    if queue.qsize() == previous_total: break # Changed from len(seen_urls) to queue.qsize()
+                    if queue.qsize() == previous_total: break
             else:
                 no_new_items_count = 0
             
-            previous_total = queue.qsize() # Changed from len(seen_urls) to queue.qsize()
-            print(f"   🔍 Found {queue.qsize()} pins... (Queue size: {queue.qsize()})", end='\r') # Changed from len(seen_urls) to queue.qsize()
+            previous_total = queue.qsize()
+            print(f"   🔍 Found {queue.qsize()} pins... (Queue size: {queue.qsize()})", end='\r')
             await page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
             await asyncio.sleep(SCROLL_DELAY)
             scrolls += 1
